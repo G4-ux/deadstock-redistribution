@@ -74,11 +74,10 @@ def validate_inventory_df(df: pd.DataFrame) -> None:
     )
 
     mismatches = df[calculated_closing != df['Closing_Stock']]
-    if not mismatches.empty:
-        raise ValueError(
-            f"Inventory balance mismatch detected in {len(mismatches)} rows. "
-            f"(Opening + Replenishment - Sales != Closing)"
-        )
+
+    # Allow mismatches but flag them
+    df['inventory_mismatch'] = calculated_closing != df['Closing_Stock']
+
 
     # ---------------------------------------------------------
     # CHECK 5: Date Format Validation
