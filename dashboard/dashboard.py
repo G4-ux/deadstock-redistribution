@@ -11,6 +11,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 
+from logic.preprocessing import load_inventory
+from logic.scoring import compute_deadstock_score
+from logic.ranking import get_redistribution_recommendations
+
 # ---- Page config ----
 st.set_page_config(
     page_title="Inventory Optimization Dashboard",
@@ -168,83 +172,10 @@ hr {
 """, unsafe_allow_html=True)
 
 # ---- Helper Functions ----
-@st.cache_data
-def generate_placeholder_data():
-    """Generate sample data"""
-    rng = np.random.default_rng(42)
-    skus = [f"SKU-{i:03d}" for i in range(1, 11)]
-    stores = [f"Store-{c}" for c in "ABCDE"]
-    rows = []
-    for sku in skus:
-        for store in stores:
-            sales = int(max(0, rng.poisson(20) - rng.integers(0, 10)))
-            stock = int(max(0, sales * rng.integers(0, 6) + rng.integers(0, 10)))
-            sell_through = round(sales / max(1, stock + sales), 2) if (stock + sales) > 0 else 0
-            rows.append((sku, store, stock, sales, sell_through))
-    return pd.DataFrame(rows, columns=["SKU", "Store", "Stock", "Sales", "Sell_Through"])
 
-def load_data(uploaded_file):
-    """Load CSV or Excel file"""
-    try:
-        if uploaded_file.name.lower().endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(uploaded_file)
-        else:
-            df = pd.read_csv(uploaded_file)
-        
-        df.columns = [c.strip() for c in df.columns]
-        expected = {"SKU", "Store", "Stock", "Sales", "Sell_Through"}
-        
-        if not expected.issubset(set(df.columns)):
-            st.warning(f"Missing columns. Expected: {sorted(expected)}")
-            return None
-        
-        df["Stock"] = pd.to_numeric(df["Stock"], errors="coerce").fillna(0).astype(int)
-        df["Sales"] = pd.to_numeric(df["Sales"], errors="coerce").fillna(0).astype(int)
-        df["Sell_Through"] = pd.to_numeric(df["Sell_Through"], errors="coerce").fillna(0).astype(float)
-        return df
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        return None
 
-def compute_flags(df):
-    """Add slow-moving and overstocked flags"""
-    df = df.copy()
-    df["Slow_Moving"] = df["Sell_Through"] < 0.20
-    df["Overstocked"] = df["Stock"] > (df["Sales"] * 3)
-    return df
 
-def sku_level_summary(df):
-    """Aggregate to SKU level"""
-    if df.empty:
-        return pd.DataFrame()
-    
-    return df.groupby("SKU").agg(
-        Total_Stock=("Stock", "sum"),
-        Total_Sales=("Sales", "sum"),
-        Avg_Sell_Through=("Sell_Through", "mean"),
-        Stores=("Store", lambda s: ", ".join(sorted(s.unique())))
-    ).reset_index().assign(
-        Slow_Moving=lambda x: x["Avg_Sell_Through"] < 0.20,
-        Overstocked=lambda x: x["Total_Stock"] > (x["Total_Sales"] * 3)
-    )
 
-def build_recommendations(df):
-    """Build redistribution recommendations"""
-    if df.empty:
-        return pd.DataFrame()
-    
-    recs = []
-    for sku, group in df.groupby("SKU"):
-        high = list(group.loc[group["Sell_Through"] > 0.6, "Store"].unique())
-        low = list(group.loc[group["Sell_Through"] < 0.2, "Store"].unique())
-        recs.append({
-            "SKU": sku,
-            "High_Demand_Stores": ", ".join(high) if high else "-",
-            "Low_Demand_Stores": ", ".join(low) if low else "-",
-            "High_Count": len(high),
-            "Low_Count": len(low),
-        })
-    return pd.DataFrame(recs)
 
 def get_plotly_theme():
     """Dark theme for Plotly charts"""
@@ -288,10 +219,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.markdown("---")
 
-# ---- Process Data ----
-df = compute_flags(df)
-sku_summary = sku_level_summary(df)
-recs = build_recommendations(df)
+df_raw = load_inventory("data/raw/synthetic_retail_sales_inventory.csv")
+df_scored = compute_deadstock_score(df_raw)
+recs = get_redistribution_recommendations(df_scored)
+
 
 # ---- Metrics ----
 col1, col2, col3, col4 = st.columns(4)
@@ -529,3 +460,22 @@ st.markdown("""
     🚀 Built with Streamlit • Powered by AI • Production-ready
 </p>
 """, unsafe_allow_html=True)
+import streamlit as st
+import pandas as pd
+from pathlib import Path
+
+st.set_page_config(page_title="Deadstock Redistribution — Demo", layout="wide")
+st.title("Deadstock Redistribution — Demo")
+
+data_path = Path("data/raw/synthetic_retail_sales_inventory.csv")
+
+if data_path.exists():
+	df = pd.read_csv(data_path)
+	st.markdown(f"**Loaded dataset:** {data_path} — {df.shape[0]} rows, {df.shape[1]} columns")
+	st.dataframe(df.head(100))
+	with st.expander("Columns"):
+		st.write(list(df.columns))
+else:
+	st.warning(f"Sample dataset not found at {data_path}.")
+	st.info("Place your CSV at data/raw/synthetic_retail_sales_inventory.csv to view it here.")
+
