@@ -15,6 +15,27 @@ from logic.preprocessing import load_inventory
 from logic.scoring import compute_deadstock_score
 from logic.ranking import get_redistribution_recommendations
 
+def load_data(uploaded_file):
+    """Load data from uploaded file"""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        elif uploaded_file.name.endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(uploaded_file)
+        else:
+            return None
+        
+        # Apply the same processing as load_inventory
+        from logic.data_validation import validate_inventory_df
+        from logic.data_cleaning import clean_inventory_df
+        
+        validate_inventory_df(df)
+        df = clean_inventory_df(df)
+        return df
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
+        return None
+
 # ---- Page config ----
 st.set_page_config(
     page_title="Inventory Optimization Dashboard",
@@ -199,10 +220,10 @@ with st.sidebar:
         if df is not None:
             st.success(f"✅ Loaded {len(df):,} rows")
         else:
-            df = generate_placeholder_data()
+            df = load_inventory("data/raw/synthetic_retail_sales_inventory.csv")
             st.warning("⚠️ Using sample data")
     else:
-        df = generate_placeholder_data()
+        df = load_inventory("data/raw/synthetic_retail_sales_inventory.csv")
         st.info("ℹ️ Using sample data")
     
     st.markdown("---")
@@ -223,11 +244,29 @@ df_raw = load_inventory("data/raw/synthetic_retail_sales_inventory.csv")
 df_scored = compute_deadstock_score(df_raw)
 recs = get_redistribution_recommendations(df_scored)
 
+# Add flags for slow-moving and overstocked items
+df_scored['Slow_Moving'] = df_scored['deadstock_score'] > 0.7
+df_scored['Overstocked'] = df_scored['current_stock'] > (3 * df_scored['avg_daily_sales'])
+df_scored['Sell_Through'] = df_scored['sell_through_rate']  # Rename for dashboard compatibility
+
+# Create SKU-level summary
+sku_summary = (
+    df_scored.groupby('SKU', as_index=False)
+    .agg(
+        Total_Stores=('Store', 'count'),
+        Slow_Moving=('Slow_Moving', 'sum'),
+        Overstocked=('Overstocked', 'sum'),
+        Avg_Stock=('current_stock', 'mean'),
+        Avg_Sell_Through=('sell_through_rate', 'mean'),
+        Max_Deadstock_Score=('deadstock_score', 'max')
+    )
+)
+
 
 # ---- Metrics ----
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.metric("Total SKUs", f"{df['SKU'].nunique():,}")
+    st.metric("Total SKUs", f"{df_scored['SKU'].nunique():,}")
 with col2:
     slow_skus = sku_summary["Slow_Moving"].sum() if not sku_summary.empty else 0
     st.metric("Slow-moving SKUs", slow_skus, delta=f"-{slow_skus}" if slow_skus > 0 else None, delta_color="inverse")
@@ -235,7 +274,7 @@ with col3:
     over_skus = sku_summary["Overstocked"].sum() if not sku_summary.empty else 0
     st.metric("Overstocked SKUs", over_skus, delta=f"-{over_skus}" if over_skus > 0 else None, delta_color="inverse")
 with col4:
-    st.metric("Avg Sell-through", f"{df['Sell_Through'].mean():.2%}")
+    st.metric("Avg Sell-through", f"{df_scored['sell_through_rate'].mean():.2%}")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -254,7 +293,7 @@ with tab1:
     
     # Flagged items
     st.markdown("#### 🎯 Flagged Items")
-    display_df = df.copy().sort_values(["SKU", "Store"]).reset_index(drop=True)
+    display_df = df_scored.copy().sort_values(["SKU", "Store"]).reset_index(drop=True)
     display_df["Slow_Moving"] = display_df["Slow_Moving"].map({True: "⚠️ Yes", False: ""})
     display_df["Overstocked"] = display_df["Overstocked"].map({True: "📦 Yes", False: ""})
     
@@ -273,21 +312,21 @@ with tab1:
     col1, col2 = st.columns([2.5, 1])
     
     with col1:
-        fig = px.histogram(df, x="Stock", nbins=30, title="Stock Distribution", color_discrete_sequence=["#8B5CF6"])
+        fig = px.histogram(df_scored, x="current_stock", nbins=30, title="Stock Distribution", color_discrete_sequence=["#8B5CF6"])
         fig.update_layout(**get_plotly_theme(), height=400, margin=dict(l=20,r=20,t=60,b=40))
         fig.update_traces(marker_line_color='rgba(139,92,246,0.5)', marker_line_width=1.5)
         st.plotly_chart(fig, use_container_width=True)
     
     with col2:
-        st.metric("📈 Median Stock", f"{int(df['Stock'].median()):,}")
-        st.metric("📊 Total Stock", f"{int(df['Stock'].sum()):,}")
-        st.metric("🏪 Stores", f"{df['Store'].nunique()}")
-        st.metric("📦 Records", f"{len(df):,}")
+        st.metric("📈 Median Stock", f"{int(df_scored['current_stock'].median()):,}")
+        st.metric("📊 Total Stock", f"{int(df_scored['current_stock'].sum()):,}")
+        st.metric("🏪 Stores", f"{df_scored['Store'].nunique()}")
+        st.metric("📦 Records", f"{len(df_scored):,}")
     
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("### 🏆 Store Performance Ranking")
     
-    store_rank = df.groupby("Store")["Sell_Through"].mean().reset_index().sort_values("Sell_Through", ascending=False)
+    store_rank = df_scored.groupby("Store")["Sell_Through"].mean().reset_index().sort_values("Sell_Through", ascending=False)
     fig2 = px.bar(store_rank, x="Store", y="Sell_Through", title="Average Sell-Through by Store",
                   color="Sell_Through", color_continuous_scale=["#EF4444", "#F59E0B", "#10B981"])
     fig2.update_layout(**get_plotly_theme(), height=450, margin=dict(l=20,r=20,t=60,b=40))
@@ -301,6 +340,15 @@ with tab2:
     
     if not recs.empty:
         recs_display = recs.copy()
+        
+        # Calculate counts per SKU
+        sku_counts = df_scored.groupby('SKU').agg(
+            High_Count=('deadstock_score', lambda x: (x > 0.7).sum()),
+            Low_Count=('deadstock_score', lambda x: (x <= 0.7).sum())
+        ).reset_index()
+        
+        recs_display = recs_display.merge(sku_counts, on='SKU', how='left')
+        
         recs_display["Action"] = recs_display.apply(lambda r:
             "🔄 Transfer low→high" if (r["High_Count"]>0 and r["Low_Count"]>0) else
             "💰 Promotions needed" if r["Low_Count"]>0 else
@@ -341,26 +389,27 @@ with tab2:
 with tab3:
     st.markdown("### 🔍 SKU Deep Dive")
     
-    if df['SKU'].nunique() > 0:
-        selected_sku = st.selectbox("Select SKU", sorted(df['SKU'].unique()))
+    if df_scored['SKU'].nunique() > 0:
+        selected_sku = st.selectbox("Select SKU", sorted(df_scored['SKU'].unique()))
         
         if selected_sku:
-            sku_df = df[df['SKU'] == selected_sku].sort_values('Sell_Through', ascending=False)
+            sku_df = df_scored[df_scored['SKU'] == selected_sku].sort_values('Sell_Through', ascending=False)
             st.markdown(f"<h2 style='text-align: center;'>📦 {selected_sku}</h2>", unsafe_allow_html=True)
             
             col1, col2 = st.columns([2.5, 1])
             
             with col1:
                 st.markdown("#### 🏪 Store Performance")
-                sku_display = sku_df[['Store','Stock','Sales','Sell_Through','Slow_Moving','Overstocked']].copy()
+                sku_display = sku_df[['Store','current_stock','total_sales','Sell_Through','Slow_Moving','Overstocked']].copy()
+                sku_display = sku_display.rename(columns={'current_stock': 'Stock', 'total_sales': 'Sales'})
                 sku_display['Slow_Moving'] = sku_display['Slow_Moving'].map({True: "⚠️", False: ""})
                 sku_display['Overstocked'] = sku_display['Overstocked'].map({True: "📦", False: ""})
                 st.dataframe(sku_display.style.format({"Sell_Through": "{:.2%}"}), 
                              use_container_width=True, height=320)
             
             with col2:
-                st.metric("💼 Total Stock", f"{int(sku_df['Stock'].sum()):,}")
-                st.metric("💰 Total Sales", f"{int(sku_df['Sales'].sum()):,}")
+                st.metric("💼 Total Stock", f"{int(sku_df['current_stock'].sum()):,}")
+                st.metric("💰 Total Sales", f"{int(sku_df['total_sales'].sum()):,}")
                 st.metric("📈 Avg Sell-Through", f"{sku_df['Sell_Through'].mean():.2%}")
                 st.metric("🏪 Stores", len(sku_df))
             
@@ -375,7 +424,7 @@ with tab3:
                 st.plotly_chart(fig4, use_container_width=True)
             
             with col2:
-                fig5 = px.scatter(sku_df, x='Stock', y='Sales', size='Stock', color='Sell_Through',
+                fig5 = px.scatter(sku_df, x='current_stock', y='total_sales', size='current_stock', color='Sell_Through',
                                   hover_name='Store', title='Stock vs Sales', color_continuous_scale="Viridis")
                 fig5.update_layout(**get_plotly_theme(), height=400, margin=dict(l=20,r=20,t=60,b=40))
                 st.plotly_chart(fig5, use_container_width=True)
@@ -405,11 +454,11 @@ with tab3:
                 """, unsafe_allow_html=True)
             
             with c3:
-                balance = "Balanced" if sku_df['Stock'].std() < sku_df['Stock'].mean() else "Unbalanced"
+                balance = "Balanced" if sku_df['current_stock'].std() < sku_df['current_stock'].mean() else "Unbalanced"
                 st.markdown(f"""
                 <div style='padding:1rem; background:rgba(59,130,246,0.1); border-radius:12px; border-left:4px solid #3B82F6'>
                     <h4 style='color:#3B82F6; margin:0'>📊 Stock Balance</h4>
-                    <p style='color:#CBD5E1; margin:0.5rem 0 0'>Std: {sku_df['Stock'].std():.1f}<br>{balance}</p>
+                    <p style='color:#CBD5E1; margin:0.5rem 0 0'>Std: {sku_df['current_stock'].std():.1f}<br>{balance}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -422,7 +471,7 @@ with tab4:
     with col2:
         show_over = st.checkbox("Show only overstocked")
     
-    filtered_df = df.copy()
+    filtered_df = df_scored.copy()
     if show_slow:
         filtered_df = filtered_df[filtered_df['Slow_Moving'] == True]
     if show_over:
@@ -435,10 +484,10 @@ with tab4:
         csv = filtered_df.to_csv(index=False).encode('utf-8')
         st.download_button("⬇️ Filtered CSV", csv, f"filtered_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv")
     with col2:
-        full_csv = df.to_csv(index=False).encode('utf-8')
+        full_csv = df_scored.to_csv(index=False).encode('utf-8')
         st.download_button("⬇️ Full CSV", full_csv, f"full_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv")
     with col3:
-        st.caption(f"📊 Showing {len(filtered_df):,} of {len(df):,} records")
+        st.caption(f"📊 Showing {len(filtered_df):,} of {len(df_scored):,} records")
 
 # ---- Footer ----
 st.markdown("---")
